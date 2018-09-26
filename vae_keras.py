@@ -115,7 +115,7 @@ class VAEloss():
         
         return kl
     
-    def likelihood(y, y_pred):
+    def likelihood(self, y, y_pred):
         return -metrics.binary_crossentropy(y, y_pred)*786
 
     def vaeloss(self,x, x_hat):
