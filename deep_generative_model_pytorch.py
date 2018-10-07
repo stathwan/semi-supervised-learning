@@ -14,6 +14,7 @@ cuda = torch.cuda.is_available()
 import matplotlib.pyplot as plt
 
 
+
 class Encoder(nn.Module):
     '''
     distribution q_phi (z|x) that infer p(z|x)
@@ -133,11 +134,10 @@ class DeepGenerativeModel(nn.Module):
         super(DeepGenerativeModel,self).__init__()
         
         self.p_param = p_param
-        [x_dim, self.y_dim, h_dim, z_dim] = dims
-        self.z_dim = z_dim
+        [x_dim, self.y_dim, h_dim, self.z_dim] = dims
 
-        self.encoder = Encoder([x_dim, h_dim, z_dim])
-        self.decoder = Decoder([z_dim, list(reversed(h_dim)), x_dim])
+        self.encoder = Encoder([x_dim+ self.y_dim, h_dim, self.z_dim])
+        self.decoder = Decoder([self.z_dim+ self.y_dim, list(reversed(h_dim)), x_dim])
         self.classifier = Classifier([x_dim, h_dim[0], self.y_dim])
         self.kl_divergence = 0
 
@@ -162,8 +162,8 @@ class DeepGenerativeModel(nn.Module):
 
     def forward(self, x, y):
         # Add label and data and generate latent variable
-        z, z_mu, z_log_var = self.encoder(torch.cat([x, y], dim=1))
-
+        z_mu, z_log_var = self.encoder(torch.cat([x, y], dim=1))
+        z = Sample()((z_mu, z_log_var))
         self.kl_divergence = self._kld(z, (z_mu, z_log_var))
 
         # Reconstruct data point from latent data and label
@@ -188,51 +188,143 @@ class DeepGenerativeModel(nn.Module):
    
         
                                                                                                                                                                                                        
-      
+from utils import log_sum_exp, enumerate_discrete
+from itertools import repeat
+from itertools import cycle
+
+class ImportanceWeightedSampler(object):
+    """
+    Importance weighted sampler [Burda 2015] to
+    be used in conjunction with SVI.
+    """
+    def __init__(self, mc=1, iw=1):
+        """
+        Initialise a new sampler.
+        :param mc: number of Monte Carlo samples
+        :param iw: number of Importance Weighted samples
+        """
+        self.mc = mc
+        self.iw = iw
+
+    def resample(self, x):
+        return x.repeat(self.mc * self.iw, 1)
+
+    def __call__(self, elbo):
+        elbo = elbo.view(1, 1, -1)
+        elbo = torch.mean(log_sum_exp(elbo, dim=1, sum_op=torch.mean), dim=0)
+        return elbo.view(-1)
+
+def log_standard_categorical(p):
+    """
+    Calculates the cross entropy between a (one-hot) categorical vector
+    and a standard (uniform) categorical distribution.
+
+    :param p: one-hot categorical distribution
+    :return: H(p, u)
+    """
+    # Uniform prior over y
+    prior = F.softmax(torch.ones_like(p), dim=1)
+    prior.requires_grad = False
+
+    cross_entropy = -torch.sum(p * torch.log(prior + 1e-8), dim=1)
+
+    return cross_entropy
+        
+
+class Stochastic_variational_inference(nn.Module):
+    """
+    Stochastic variational inference (SVI).
+    """
+
+    
+    def __init__(self, model, likelihood=F.binary_cross_entropy):
+        """
+        Initialises a new SVI optimizer for semi-
+        supervised learning.
+        :param model: semi-supervised model to evaluate
+        :param likelihood: p(x|y,z) for example BCE or MSE
+        :param sampler: sampler for x and y, e.g. for Monte Carlo
+        :param beta: warm-up/scaling of KL-term
+        """
+        super(Stochastic_variational_inference, self).__init__()
+        self.model = model
+        self.likelihood = likelihood
 
 
+    def forward(self, x, y=None):
+        is_labelled = False if y is None else True
 
+        # Prepare for sampling
+        xs, ys = (x, y)
 
+        # Enumerate choices of label
+        if not is_labelled:
+            ys = enumerate_discrete(xs, self.model.y_dim)
+            xs = xs.repeat(self.model.y_dim, 1)
+
+        reconstruction = self.model(xs, ys)
+
+        # p(x|y,z)
+        likelihood = -self.likelihood(reconstruction, xs)
+
+        # p(y)
+        prior = -log_standard_categorical(ys)
+         
+        # Equivalent to -L(x, y)
+        elbo = likelihood + prior - self.model.kl_divergence        
+            
+        L = self.sampler(elbo)
+
+        if is_labelled:
+            return torch.mean(L)
+       
+        logits = self.model.classify(x)
+
+        L = L.view_as(logits.t()).t()
+
+        # Calculate entropy H(q(y|x)) and sum over all labels
+        H = -torch.sum(torch.mul(logits, torch.log(logits + 1e-8)), dim=-1)
+        L = torch.sum(torch.mul(logits, L), dim=-1)
+
+        # Equivalent to -U(x)
+        U = L + H
+        
+        return torch.mean(U)
+        
+        
 ### load data
 
 # Only use 10 labelled examples per class
 # The rest of the data is unlabelled.
+#from datautils import get_mnist
 from datautils import get_mnist
+
 labelled, unlabelled, validation = get_mnist(location="./", batch_size=64, labels_per_class=10)
 alpha = 0.1 * len(unlabelled) / len(labelled)
 
 # use custom BCE to sum up with Regularization term 
 def binary_cross_entropy(pred_y,y):
-    return -torch.sum(y*torch.log(pred_y+1e-8)+ (1-y)*torch.log(1-pred_y + 1e-8), dim=-1)      
-### 
 
-(mu, log_var) = (0, 0)
-p_param = (mu, log_var)
+
+### build model
+p_param = (mu, log_var) = (0, 0)
 dims=([784, 10, [256, 128], 32])
 
 model = DeepGenerativeModel(dims,p_param)
 optimizer = torch.optim.Adam(model.parameters())
 
 
-from itertools import cycle
-from inference import SVI, ImportanceWeightedSampler
-
-# You can use importance weighted samples [Burda, 2015] to get a better estimate
-# on the log-likelihood.
-sampler = ImportanceWeightedSampler(mc=1, iw=1)
-visuallize=True
-
 if cuda: model = model.cuda()
-elbo = SVI(model, likelihood=binary_cross_entropy, sampler=sampler, visuallize=visuallize)
 
+elbo = Stochastic_variational_inference(model, likelihood=binary_cross_entropy)
 
-
-from torch.autograd import Variable
 
 for epoch in range(10):
     model.train()
     total_loss, accuracy = (0, 0)
+
     for (x, y), (u, _) in zip(cycle(labelled), unlabelled):
+
         # Wrap in variables
         x, y, u = Variable(x), Variable(y), Variable(u)
 
@@ -253,24 +345,13 @@ for epoch in range(10):
         classication_loss = torch.sum(y * torch.log(logits + 1e-8), dim=1).mean()
 
         J_alpha = L - alpha * classication_loss + U
-        print('J_alpha     : {}'.format(J_alpha))
-     
+
         
         J_alpha.backward()
         optimizer.step()
         optimizer.zero_grad()
-        print('J_alpha.data     : {}'.format(J_alpha.data))
-        break
         total_loss += J_alpha.data[0]
-        accuracy += torch.mean((torch.max(logits, 1)[1].data == torch.max(y, 1)[1].data).float())
-        if visuallize:
-            print('logits     : {} {}'.format(logits,logits.shape))
-            print('classication_loss     : {}'.format(classication_loss))
-            print('J_alpha     : {}'.format(J_alpha))
-            break
-            
-    if visuallize:
-        break    
+        accuracy += torch.mean((torch.max(logits, 1)[1].data == torch.max(y, 1)[1].data).float())             
     
     if epoch % 1 == 0:
         model.eval()
