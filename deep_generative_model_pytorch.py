@@ -12,7 +12,7 @@ from torch.autograd import Variable
 import torch.nn.functional as F
 cuda = torch.cuda.is_available()
 import matplotlib.pyplot as plt
-
+from itertools import cycle
 
 
 class Encoder(nn.Module):
@@ -186,30 +186,7 @@ class DeepGenerativeModel(nn.Module):
         x = self.decoder(torch.cat([z, y], dim=1))
         return x
    
-        
-                                                                                                                                                                                                       
-from utils import log_sum_exp, enumerate_discrete
-from itertools import repeat
-from itertools import cycle
-
-
-
-def log_standard_categorical(p):
-    """
-    Calculates the cross entropy between a (one-hot) categorical vector
-    and a standard (uniform) categorical distribution.
-
-    :param p: one-hot categorical distribution
-    :return: H(p, u)
-    """
-    # Uniform prior over y
-    prior = F.softmax(torch.ones_like(p), dim=1)
-    prior.requires_grad = False
-
-    cross_entropy = -torch.sum(p * torch.log(prior + 1e-8), dim=1)
-
-    return cross_entropy
-        
+              
 
 class Stochastic_variational_inference(nn.Module):
     """
@@ -230,11 +207,63 @@ class Stochastic_variational_inference(nn.Module):
         self.model = model
         self.likelihood = likelihood
 
+    def log_sum_exp(self, tensor, dim=-1, sum_op=torch.sum):
+        """
+        Uses the LogSumExp (LSE) as an approximation for the sum in a log-domain.
+        :param tensor: Tensor to compute LSE over
+        :param dim: dimension to perform operation over
+        :param sum_op: reductive operation to be applied, e.g. torch.sum or torch.mean
+        :return: LSE
+        """
+        max, _ = torch.max(tensor, dim=dim, keepdim=True)
+        return torch.log(sum_op(torch.exp(tensor - max), dim=dim, keepdim=True) + 1e-8) + max
+
     def sampler(self,elbo):
         elbo = elbo.view(1, 1, -1)
-        elbo = torch.mean(log_sum_exp(elbo, dim=1, sum_op=torch.mean), dim=0)
+        elbo = torch.mean(self.log_sum_exp(elbo, dim=1, sum_op=torch.mean), dim=0)
         return elbo.view(-1)
 
+    def log_standard_categorical(self,p):
+        """
+        Calculates the cross entropy between a (one-hot) categorical vector
+        and a standard (uniform) categorical distribution.
+    
+        :param p: one-hot categorical distribution
+        :return: H(p, u)
+        """
+        # Uniform prior over y
+        prior = F.softmax(torch.ones_like(p), dim=1)
+        prior.requires_grad = False
+    
+        cross_entropy = -torch.sum(p * torch.log(prior + 1e-8), dim=1)
+    
+        return cross_entropy
+    
+    def enumerate_discrete(self, x, y_dim):
+        """
+        Generates a `torch.Tensor` of size batch_size x n_labels of
+        the given label.
+    
+        Example: generate_label(2, 1, 3) #=> torch.Tensor([[0, 1, 0],
+                                                           [0, 1, 0]])
+        :param x: tensor with batch size to mimic
+        :param y_dim: number of total labels
+        :return variable
+        """
+        def batch(batch_size, label):
+            labels = (torch.ones(batch_size, 1) * label).type(torch.LongTensor)
+            y = torch.zeros((batch_size, y_dim))
+            y.scatter_(1, labels, 1)
+            return y.type(torch.LongTensor)
+    
+        batch_size = x.size(0)
+        generated = torch.cat([batch(batch_size, i) for i in range(y_dim)])
+    
+        if x.is_cuda:
+            generated = generated.cuda()
+    
+        return Variable(generated.float())
+    
     def forward(self, x, y=None):
         is_labelled = False if y is None else True
 
@@ -243,16 +272,17 @@ class Stochastic_variational_inference(nn.Module):
 
         # Enumerate choices of label
         if not is_labelled:
-            ys = enumerate_discrete(xs, self.model.y_dim)
+            ys = self.enumerate_discrete(xs, self.model.y_dim)
             xs = xs.repeat(self.model.y_dim, 1)
-
+            
         reconstruction = self.model(xs, ys)
 
         # p(x|y,z)
+
         likelihood = -self.likelihood(reconstruction, xs)
 
         # p(y)
-        prior = -log_standard_categorical(ys)
+        prior = -self.log_standard_categorical(ys)
          
         # Equivalent to -L(x, y)
         elbo = likelihood + prior - self.model.kl_divergence        
@@ -281,14 +311,68 @@ class Stochastic_variational_inference(nn.Module):
 # Only use 10 labelled examples per class
 # The rest of the data is unlabelled.
 #from datautils import get_mnist
-from datautils import get_mnist
+import numpy as np
+n_labels=10
+
+def get_mnist(location="./", batch_size=64, labels_per_class=100):
+    from functools import reduce
+    from operator import __or__
+    from torch.utils.data.sampler import SubsetRandomSampler
+    from torchvision.datasets import MNIST
+    import torchvision.transforms as transforms
+
+    def onehot(k):
+        """
+        Converts a number to its one-hot or 1-of-k representation
+        vector.
+        :param k: (int) length of vector
+        :return: onehot function
+        """
+        def encode(label):
+            y = torch.zeros(k)
+            if label < k:
+                y[label] = 1
+            return y
+            
+        return encode
+        
+    flatten_bernoulli = lambda x: transforms.ToTensor()(x).view(-1).bernoulli()
+
+    mnist_train = MNIST(location, train=True, download=True,
+                        transform=flatten_bernoulli, target_transform=onehot(n_labels))
+    mnist_valid = MNIST(location, train=False, download=True,
+                        transform=flatten_bernoulli, target_transform=onehot(n_labels))
+
+    
+    def get_sampler(labels, n=None):
+        # Only choose digits in n_labels
+        (indices,) = np.where(reduce(__or__, [labels == i for i in np.arange(n_labels)]))
+
+        # Ensure uniform distribution of labels
+        np.random.shuffle(indices)
+        indices = np.hstack([list(filter(lambda idx: labels[idx] == i, indices))[:n] for i in range(n_labels)])
+
+        indices = torch.from_numpy(indices)
+        sampler = SubsetRandomSampler(indices)
+        return sampler
+
+    # Dataloaders for MNIST
+    labelled = torch.utils.data.DataLoader(mnist_train, batch_size=batch_size, num_workers=0, pin_memory=cuda,
+                                           sampler=get_sampler(mnist_train.train_labels.numpy(), labels_per_class))
+    unlabelled = torch.utils.data.DataLoader(mnist_train, batch_size=batch_size, num_workers=0, pin_memory=cuda,
+                                             sampler=get_sampler(mnist_train.train_labels.numpy()))
+    validation = torch.utils.data.DataLoader(mnist_valid, batch_size=batch_size, num_workers=0, pin_memory=cuda,
+                                             sampler=get_sampler(mnist_valid.test_labels.numpy()))
+
+    return labelled, unlabelled, validation
+
 
 labelled, unlabelled, validation = get_mnist(location="./", batch_size=64, labels_per_class=10)
 alpha = 0.1 * len(unlabelled) / len(labelled)
 
 # use custom BCE to sum up with Regularization term 
 def binary_cross_entropy(pred_y,y):
-    return -torch.sum(x * torch.log(pred_y + 1e-8) + (1 - x) * torch.log(1 - pred_y + 1e-8), dim=1)
+    return -torch.sum(y * torch.log(pred_y + 1e-8) + (1 - y) * torch.log(1 - pred_y + 1e-8), dim=1)
 
 ### build model
 p_param = (mu, log_var) = (0, 0)
@@ -333,7 +417,7 @@ for epoch in range(10):
         J_alpha.backward()
         optimizer.step()
         optimizer.zero_grad()
-        total_loss += J_alpha.data[0]
+        total_loss += J_alpha.item()
         accuracy += torch.mean((torch.max(logits, 1)[1].data == torch.max(y, 1)[1].data).float())             
     
     if epoch % 1 == 0:
@@ -357,7 +441,7 @@ for epoch in range(10):
 
             J_alpha = L + alpha * classication_loss + U
 
-            total_loss += J_alpha.data[0]
+            total_loss += J_alpha.item()
 
             _, pred_idx = torch.max(logits, 1)
             _, lab_idx = torch.max(y, 1)
