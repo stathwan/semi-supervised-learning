@@ -192,27 +192,7 @@ from utils import log_sum_exp, enumerate_discrete
 from itertools import repeat
 from itertools import cycle
 
-class ImportanceWeightedSampler(object):
-    """
-    Importance weighted sampler [Burda 2015] to
-    be used in conjunction with SVI.
-    """
-    def __init__(self, mc=1, iw=1):
-        """
-        Initialise a new sampler.
-        :param mc: number of Monte Carlo samples
-        :param iw: number of Importance Weighted samples
-        """
-        self.mc = mc
-        self.iw = iw
 
-    def resample(self, x):
-        return x.repeat(self.mc * self.iw, 1)
-
-    def __call__(self, elbo):
-        elbo = elbo.view(1, 1, -1)
-        elbo = torch.mean(log_sum_exp(elbo, dim=1, sum_op=torch.mean), dim=0)
-        return elbo.view(-1)
 
 def log_standard_categorical(p):
     """
@@ -250,6 +230,10 @@ class Stochastic_variational_inference(nn.Module):
         self.model = model
         self.likelihood = likelihood
 
+    def sampler(self,elbo):
+        elbo = elbo.view(1, 1, -1)
+        elbo = torch.mean(log_sum_exp(elbo, dim=1, sum_op=torch.mean), dim=0)
+        return elbo.view(-1)
 
     def forward(self, x, y=None):
         is_labelled = False if y is None else True
@@ -304,7 +288,7 @@ alpha = 0.1 * len(unlabelled) / len(labelled)
 
 # use custom BCE to sum up with Regularization term 
 def binary_cross_entropy(pred_y,y):
-
+    return -torch.sum(x * torch.log(pred_y + 1e-8) + (1 - x) * torch.log(1 - pred_y + 1e-8), dim=1)
 
 ### build model
 p_param = (mu, log_var) = (0, 0)
@@ -324,7 +308,6 @@ for epoch in range(10):
     total_loss, accuracy = (0, 0)
 
     for (x, y), (u, _) in zip(cycle(labelled), unlabelled):
-
         # Wrap in variables
         x, y, u = Variable(x), Variable(y), Variable(u)
 

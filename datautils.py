@@ -3,6 +3,7 @@ import numpy as np
 import sys
 from urllib import request
 from torch.utils.data import Dataset
+sys.path.append("../semi-supervised")
 n_labels = 10
 cuda = torch.cuda.is_available()
 
@@ -69,11 +70,12 @@ def get_mnist(location="./", batch_size=64, labels_per_class=100):
         return sampler
 
     # Dataloaders for MNIST
-    labelled = torch.utils.data.DataLoader(mnist_train, batch_size=batch_size, num_workers=2, pin_memory=cuda,
-                                           sampler=get_sampler(mnist_train.train_labels.numpy(), labels_per_class))
-    unlabelled = torch.utils.data.DataLoader(mnist_train, batch_size=batch_size, num_workers=2, pin_memory=cuda,
-                                             sampler=get_sampler(mnist_train.train_labels.numpy()))
-    validation = torch.utils.data.DataLoader(mnist_valid, batch_size=batch_size, num_workers=2, pin_memory=cuda,
-                                             sampler=get_sampler(mnist_valid.test_labels.numpy()))
+    kwargs = {'num_workers': 1, 'pin_memory': True} if cuda else {}
+    labelled = torch.utils.data.DataLoader(mnist_train, batch_size=batch_size,
+                                           sampler=get_sampler(mnist_train.train_labels.numpy(), labels_per_class), **kwargs)
+    unlabelled = torch.utils.data.DataLoader(mnist_train, batch_size=batch_size, 
+                                             sampler=get_sampler(mnist_train.train_labels.numpy()), **kwargs)
+    validation = torch.utils.data.DataLoader(mnist_valid, batch_size=batch_size, 
+                                             sampler=get_sampler(mnist_valid.test_labels.numpy()), **kwargs)
 
     return labelled, unlabelled, validation
